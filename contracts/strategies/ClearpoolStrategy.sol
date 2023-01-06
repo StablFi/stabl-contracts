@@ -2,67 +2,70 @@
 pragma solidity ^0.8.0;
 
 /**
- * @title MeshSwap Strategy
- * @notice Investment strategy for investing stablecoins via NeshSwap Strategy
+ * @title Clearpool Strategy
+ * @notice Investment strategy for investing stablecoins via Clearpool Strategy
  */
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { SafeMath } from "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol"  ;
-
-
 import { StableMath } from "../utils/StableMath.sol";
-import "../exchanges/UniswapV2Exchange.sol";
-import "../interfaces/IMeshSwapLP.sol";
-import "../interfaces/IMiniVault.sol";
 import { IERC20, InitializableAbstractStrategy } from "../utils/InitializableAbstractStrategy.sol";
+
+
+import {IPoolBase, IPoolMaster} from  "../connectors/clearpool/Clearpool.sol";
+import "../interfaces/IMiniVault.sol";
 import "../exchanges/CurveExchange.sol";
 import "hardhat/console.sol";
 
 
-contract MeshSwapStrategy is InitializableAbstractStrategy, UniswapV2Exchange, CurveExchange   {
+contract ClearpoolStrategy is InitializableAbstractStrategy, CurveExchange   {
     using StableMath for uint256;
     using SafeERC20 for IERC20;
     using SafeMath for uint256;
-    using OvnMath for uint256;
 
 
     IERC20 public token0;
     IERC20 public primaryStable;
-    IERC20 public meshToken;
 
-    IMeshSwapLP public meshSwapToken0;
+    IERC20 public cPoolToken;
+
+    IPoolBase public poolBase; // Depositable, Withdrawable
+    IPoolMaster public poolMaster; // Reward Withdraw
 
 
     bytes32 poolId;
     address public swappingPool;
+    uint256[] public minThresholds;
     address public oracleRouter;
 
     /**
      * Initializer for setting up strategy internal state. This overrides the
-     * InitializableAbstractStrategy initializer as MeshSwap strategies don't fit
+     * InitializableAbstractStrategy initializer as CPOOL strategies don't fit
      * well within that abstraction.
      */
     function initialize(
-        address _platformAddress, // MeshToken address
+        address _platformAddress, // cPool address address
         address _vaultAddress,    // VaultProxy address
         address[] calldata _rewardTokenAddresses, // USDC - as in end USDC will be sent to Harvester
         address[] calldata _assets, // USDC
-        address[] calldata _pTokens, // meshSwapToken0
-        address _router,  // meshSwapRouter
+        address[] calldata _pTokens, // poolBase
+        address _poolMaster,  // poolMaster
         address _primaryStable
     ) external onlyGovernor initializer {
         require(_rewardTokenAddresses[0] != address(0), "Zero address not allowed");
         require(_pTokens[0] != address(0), "Zero address not allowed");
         require(_platformAddress != address(0), "Zero address not allowed");
-        require(_router != address(0), "Zero address not allowed");
+        require(_poolMaster != address(0), "Zero address not allowed");
         require(_primaryStable != address(0), "Zero address not allowed");
 
         token0 = IERC20(_assets[0]);
         primaryStable = IERC20(_primaryStable);
-        meshToken = IERC20(_platformAddress);
-        meshSwapToken0 = IMeshSwapLP(_pTokens[0]);
-        _setUniswapRouter(_router);
-        _abstractSetPToken(_assets[0],_pTokens[0]);
+        cPoolToken = IERC20(_platformAddress);
+        poolBase = IPoolBase(_pTokens[0]);
+        poolMaster = IPoolMaster(_poolMaster);
+
+        for (uint8 i = 0; i < 3; i++) {
+            minThresholds.push(0);
+        }
 
         super._initialize(
             _platformAddress,
@@ -78,18 +81,18 @@ contract MeshSwapStrategy is InitializableAbstractStrategy, UniswapV2Exchange, C
         swappingPool = IMiniVault(vaultAddress).swappingPool();
     }
 
-    // TODO: Deposit is not making use of _amount
     function _deposit(
         address _asset,
         uint256 _amount
     )  internal {
         require(_asset == address(primaryStable), "Token not compatible.");
+        if (primaryStable.balanceOf(address(this)) < minThresholds[0]) {
+            console.log("Deposit amount too low to be staked");
+            return;
+        }
         _swapPrimaryStableToToken0();
-        // console.log("primaryStable Balance:", primaryStable.balanceOf(address(this)));
-        // console.log("Token0 Balance:", token0.balanceOf(address(this)));
-        token0.approve(address(meshSwapToken0), token0.balanceOf(address(this)) );
-        // console.log("Depositing ", token0.balanceOf(address(this)));
-        meshSwapToken0.depositToken(token0.balanceOf(address(this)));
+        token0.approve(address(poolBase),_amount);
+        poolBase.provide(_amount);
     }
 
     function deposit(
@@ -106,68 +109,46 @@ contract MeshSwapStrategy is InitializableAbstractStrategy, UniswapV2Exchange, C
     function depositAll() external override onlyVault nonReentrant {
         _deposit(address(token0), token0.balanceOf(address(this)));
     }
-
-
     function withdraw(
         address _beneficiary,
         address _asset,
         uint256 _amount
     ) external override onlyVaultOrGovernor nonReentrant  {
         require(_asset == address(primaryStable), "Token not compatible.");
-        meshSwapToken0.withdrawToken(_amount);
-        console.log("MeshSwapStrategy - withdraw - token0: ", token0.balanceOf(address(this)));
+        // add 10 to unstake more than requested _amount
+        uint256 lpTokenAmount = (_amount + 10) * 1e18 / poolBase.getCurrentExchangeRate();
+        if (lpTokenAmount < minThresholds[1]) {
+            console.log("Unstakable LP Token amount is too low to be withdrawn: ", lpTokenAmount);
+            return;
+        }
+        poolBase.redeem(lpTokenAmount);
 
         _swapAssetToPrimaryStable();
+
         uint256 primaryStableBalance = primaryStable.balanceOf(address(this));
-        console.log("MeshSwapStrategy - withdraw - PrimaryStable: ",primaryStableBalance);
         primaryStable.safeTransfer(_beneficiary, primaryStableBalance);
     }
 
     function withdrawAll() external override onlyVaultOrGovernor nonReentrant  {
-        meshSwapToken0.withdrawTokenByAmount(meshSwapToken0.balanceOf(address(this)));
+        uint256 lpTokenAmount = poolBase.balanceOf(address(this));
+        console.log("Withdrawing all LP tokens", lpTokenAmount);
+        if (lpTokenAmount < minThresholds[1]) {
+            console.log("Unstakable LP Token amount is too low to be withdrawn: ", lpTokenAmount);
+            return;
+        }
+        poolBase.redeem(type(uint256).max);
         _swapAssetToPrimaryStable();
         uint256 primaryStableBalance = primaryStable.balanceOf(address(this));
-        // console.log("withdraw - PrimaryStable",primaryStableBalance);
         primaryStable.safeTransfer(vaultAddress, primaryStableBalance);
     }
+
     function checkBalance()
         external
         view
         override
         returns (uint256)
     {
-        uint256 primaryStableBalance = primaryStable.balanceOf(address(this));
-        uint256 token0Balance;
-        uint256 lpTokenBalance = meshSwapToken0.balanceOf(address(this));
-        // console.log("lpTokenBalance:", lpTokenBalance);
-
-        // TODO: MoreClean workground for handling non-six decimal token0
-        // Fix for handling token0 with 18 decimals
-        if (IERC20Metadata(address(token0)).decimals() != IERC20Metadata(address(primaryStable)).decimals()) {
-            lpTokenBalance = lpTokenBalance.div(10 ** (IERC20Metadata(address(token0)).decimals() - IERC20Metadata(address(primaryStable)).decimals())); // e12 = e18 - e6
-        }
-        // console.log("lpTokenBalance:", lpTokenBalance);
-        if (lpTokenBalance > 0) {
-            uint256 exchangeRateStored = meshSwapToken0.exchangeRateStored();
-            // console.log("exchangeRateStored:", exchangeRateStored);
-            token0Balance = exchangeRateStored.mul(lpTokenBalance).div(1e18);
-        }
-        // console.log("token0Balance:", token0Balance.scaleBy(IERC20Metadata(address(token0)).decimals() , 6 ));
-        uint256 primaryStableBalanceFromToken0;
-        if ( (address(token0) != address(primaryStable))  ) {
-            if (token0Balance > 0) {
-                primaryStableBalanceFromToken0 = onSwap(
-                    swappingPool,
-                    address(token0),
-                    address(primaryStable),
-                    token0Balance.scaleBy(IERC20Metadata(address(token0)).decimals() , 6 )
-                );
-                // console.log("Token0 swap -  primaryStableBalanceFromToken0 ", primaryStableBalanceFromToken0);
-            }
-        } else {
-            primaryStableBalanceFromToken0 += token0Balance;
-        }
-        return primaryStableBalanceFromToken0 + primaryStableBalance;
+        return (poolBase.balanceOf(address(this)) * poolBase.getCurrentExchangeRate() / 1e18) + primaryStable.balanceOf(address(this));
     }
 
     function collectRewardTokens()
@@ -179,30 +160,25 @@ contract MeshSwapStrategy is InitializableAbstractStrategy, UniswapV2Exchange, C
         _collectRewards();
     }
     function _collectRewards() internal {
-        meshSwapToken0.claimReward();
-        uint256 totalUsdc = 0;
-        uint256 meshBalance = meshToken.balanceOf(address(this));
-        console.log("RewardCollection - MESH Balance: ", meshBalance);
-        if (meshBalance > 10 ** 13) {
-            uint256 meshUsdc = _swapExactTokensForTokens(
-                address(meshToken),
-                address(primaryStable),
-                meshBalance,
-                address(this)
-            );
-            totalUsdc += meshUsdc;
-        }
-        uint256 balance = primaryStable.balanceOf(address(this));
-        console.log("RewardCollection - MESH -> USDC Balance: ", balance);
-        if (balance > 0) {
-            emit RewardTokenCollected(
-                harvesterAddress,
-                address(primaryStable),
-                balance
-            );
-            primaryStable.transfer(harvesterAddress, balance);
+        uint256 lpTokenAmount = poolBase.balanceOf(address(this));
+        if (lpTokenAmount > minThresholds[2]) {
+            address[] memory pools = new address[](1);
+            pools[0] = address(poolBase);
+            poolMaster.withdrawReward(pools);
+            uint256 cpoolBalance = cPoolToken.balanceOf(address(this));
+            console.log("RewardCollection - CPOOL Balance (NOT SWAPPED): ", cpoolBalance);
+        } else {
+            console.log("RewardCollection - Nothing is collected on this harvest as LP tokens are too low: ", lpTokenAmount);
         }
     }
+    function setThresholds(uint256[] calldata _minThresholds) external onlyVaultOrGovernor nonReentrant {
+        require(_minThresholds.length == 3, "3 thresholds needed");
+        // minThresholds[0] - Minimum PS to deposit
+        // minThresholds[1] - Minimum LP to withdraw
+        // minThresholds[2] - Minimum LP to collect reward on
+        minThresholds = _minThresholds;
+    }
+
     function _swapAssetToPrimaryStable() internal {
         if ( (address(token0) != address(primaryStable)) && (token0.balanceOf(address(this)) > 0) )  {
             swap(
