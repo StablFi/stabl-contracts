@@ -139,10 +139,6 @@ contract TetuStrategy is
         uint256 _amount
     ) external override onlyVaultOrGovernor nonReentrant {
         require(_asset == address(primaryStable), "Token not supported.");
-        if (Helpers.getDecimals(address(token0)) == 18 && _amount < 10 ** 10) {
-            console.log("Too low to withdraw");
-            return;
-        }
         uint256 _eq = _equivalentInToken0(_amount);
         console.log("EQ: ", _eq);
         uint256 numberOfShares = _eq.addBasisPoints(40) * smartVault.totalSupply() / smartVault.underlyingBalanceWithInvestment();
